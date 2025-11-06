@@ -1,6 +1,8 @@
 Flask==3.0.3
 gunicorn
-supabase
 groq
+gspread
+google-auth
+cryptography
 
 
