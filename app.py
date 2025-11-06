@@ -5,19 +5,27 @@ import os
 import copy
 from datetime import datetime
 import re
-from supabase import create_client, Client
 from groq import Groq
 
+# Google Sheets (gspread + google oauth)
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Symmetric encryption (Fernet)
+from cryptography.fernet import Fernet
+
+# -------------------------
+# Groq client (unchanged)
+# -------------------------
 GROQ_CLIENT = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # -------------------------
-# Supabase setup
+# Config / Files (unchanged)
 # -------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Supabase URL and KEY must be set in environment variables")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+PUBLIC_JSON = Path("all_profiles_public.json")
+FULL_JSON = Path("all_profiles_full.json")
+IMAGE_DIR = Path("static/images")
+IGNORED_JSON = Path("ignored_profiles.json")  # local backup for deleted profiles
 
 # -------------------------
 # Flask app
@@ -26,15 +34,144 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_for_demo_only_change_me")
 
 # -------------------------
-# Config / Files
+# Google Sheets + Fernet config (Render-friendly)
 # -------------------------
-PUBLIC_JSON = Path("all_profiles_public.json")
-FULL_JSON = Path("all_profiles_full.json")
-IMAGE_DIR = Path("static/images")
-IGNORED_JSON = Path("ignored_profiles.json")  # local backup for deleted profiles
+# Required environment variables:
+# - GOOGLE_SA_JSON : The full service-account JSON content (as a single env var string)
+# - GOOGLE_SHEET_ID : The spreadsheet id (from the sheet URL)
+# - PASSWORD_ENC_KEY : base64 Fernet key (generate with Fernet.generate_key())
+# Optional:
+# - GOOGLE_SHEET_USERS_TAB (default "users")
+# - GOOGLE_SHEET_ANALYTICS_TAB (default "analytics")
+
+GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+USERS_SHEET_NAME = os.environ.get("GOOGLE_SHEET_USERS_TAB", "users")
+ANALYTICS_SHEET_NAME = os.environ.get("GOOGLE_SHEET_ANALYTICS_TAB", "analytics")
+PASSWORD_ENC_KEY = os.environ.get("PASSWORD_ENC_KEY")  # fernet key (base64)
+
+# Validate minimum config
+if not GOOGLE_SA_JSON or not GOOGLE_SHEET_ID:
+    print("WARNING: GOOGLE_SA_JSON and GOOGLE_SHEET_ID must be set to enable Google Sheets integration.")
+    print("Users and analytics will not be persisted to Sheets until these are configured.")
+
+if not PASSWORD_ENC_KEY:
+    print("WARNING: PASSWORD_ENC_KEY is not set. Password encryption will be disabled until you set this env var.")
+    # We still proceed, but encrypt/decrypt helpers will check and refuse if missing.
+
+# Prepare Fernet
+FERNET = None
+if PASSWORD_ENC_KEY:
+    try:
+        FERNET = Fernet(PASSWORD_ENC_KEY.encode() if isinstance(PASSWORD_ENC_KEY, str) else PASSWORD_ENC_KEY)
+    except Exception as e:
+        print("Failed to initialize Fernet with PASSWORD_ENC_KEY:", e)
+        FERNET = None
 
 # -------------------------
-# Helpers
+# gspread client and sheet handle (initialized lazily)
+# -------------------------
+GS_CLIENT = None
+GS_SHEET = None
+
+def init_gsheets_from_env():
+    """
+    Initialize gspread client from GOOGLE_SA_JSON (the JSON content stored in an env var).
+    This avoids storing files on disk and is compatible with Render's free tier.
+    """
+    global GS_CLIENT, GS_SHEET
+    if not GOOGLE_SA_JSON or not GOOGLE_SHEET_ID:
+        return None
+    try:
+        sa_info = json.loads(GOOGLE_SA_JSON)
+    except Exception as e:
+        print("Failed to parse GOOGLE_SA_JSON env var:", e)
+        GS_CLIENT = None
+        GS_SHEET = None
+        return None
+
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        GS_CLIENT = gspread.authorize(creds)
+        GS_SHEET = GS_CLIENT.open_by_key(GOOGLE_SHEET_ID)
+        return GS_SHEET
+    except Exception as e:
+        print("Failed to initialize Google Sheets client:", e)
+        GS_CLIENT = None
+        GS_SHEET = None
+        return None
+
+# Initialize at startup (best-effort)
+init_gsheets_from_env()
+
+# Utility: ensure worksheet exists; create if missing and add headers
+def ensure_worksheet(tab_name, headers):
+    if GS_SHEET is None:
+        return None
+    try:
+        ws = GS_SHEET.worksheet(tab_name)
+    except Exception:
+        try:
+            ws = GS_SHEET.add_worksheet(title=tab_name, rows="1000", cols=str(len(headers) or 10))
+            # write header row
+            ws.append_row(headers, value_input_option="USER_ENTERED")
+        except Exception as e:
+            print(f"Failed to create worksheet {tab_name}:", e)
+            return None
+    return ws
+
+# Append row helper
+def append_row_to_sheet(tab_name, row, headers):
+    if GS_SHEET is None:
+        print("Google Sheet not configured; skipping append.")
+        return False
+    ws = ensure_worksheet(tab_name, headers)
+    if ws is None:
+        print("Worksheet unavailable:", tab_name)
+        return False
+    try:
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        # Print for debugging; don't abort the request
+        print("Failed to append row to sheet:", e)
+        return False
+
+# -------------------------
+# Sheets headers
+# -------------------------
+USERS_HEADERS = [
+    "ts",               # append timestamp (server)
+    "email",
+    "password_cipher",  # encrypted password (Fernet ciphertext)
+    "provider",
+    "created_at",       # ISO created at
+    "meta"              # JSON string for meta (ip, user_agent)
+]
+
+ANALYTICS_HEADERS = [
+    "ts",
+    "ip",
+    "url",
+    "referrer",
+    "request_path",
+    "full_path",
+    "user_agent",
+    "accept_language",
+    "client_time",
+    "timezone",
+    "screen",
+    "viewport",
+    "connection",
+    "session_id",
+    "geo",
+    "event_type",
+    "extra"
+]
+
+# -------------------------
+# Helpers (original logic preserved)
 # -------------------------
 def _merge_raw_jsons(raw_jsons):
     merged = {}
@@ -73,12 +210,7 @@ def _image_basename_from_local(image_local):
         return None
     return Path(image_local).name
 
-# New helper: collect values matching keys (collect multiple matches)
 def _collect_values(obj, key_substrings, exclude_substrings=None):
-    """
-    Traverse obj (dict/list) and collect values where the key name contains any of key_substrings
-    and does NOT contain any of exclude_substrings. Return list of str values.
-    """
     if exclude_substrings is None:
         exclude_substrings = []
 
@@ -94,13 +226,11 @@ def _collect_values(obj, key_substrings, exclude_substrings=None):
                     pass
                 matched = any(sub in kl for sub in key_substrings)
                 if matched and not any(excl in kl for excl in exclude_substrings):
-                    # capture primitive types and lists/dicts by turning to strings
                     if isinstance(v, (str, int, float, bool)):
                         results.append(str(v))
                     elif v is None:
                         pass
                     else:
-                        # if value is list/dict collect deeper primitives
                         if isinstance(v, (list, tuple)):
                             for it in v:
                                 if isinstance(it, (str, int, float, bool)):
@@ -110,26 +240,20 @@ def _collect_values(obj, key_substrings, exclude_substrings=None):
                         elif isinstance(v, dict):
                             walk(v, k)
                 else:
-                    # descend
                     if isinstance(v, (dict, list, tuple)):
                         walk(v, k)
                     else:
-                        # If parent key might be address_details (explicit case handled elsewhere)
                         pass
         elif isinstance(node, (list, tuple)):
             for item in node:
                 walk(item, parent_key)
         else:
-            # primitive: nothing to do without a key
             pass
 
     walk(obj)
-    # remove empties, dedupe
     cleaned = [s.strip() for s in results if s and str(s).strip()]
-    # normalize spacing and return
     return list(dict.fromkeys(cleaned))
 
-# Build a search text for a profile from only allowed fields
 def _build_search_text_for_profile(pid, public_profile, full_raw):
     tokens = []
 
@@ -146,7 +270,6 @@ def _build_search_text_for_profile(pid, public_profile, full_raw):
     # 3) Mobile / phone / contact
     mobile_keys = ["mobile", "phone", "contact", "telephone", "tel"]
     mobiles = []
-    # search both public_profile and full_raw
     mobiles += _collect_values(public_profile, mobile_keys)
     if isinstance(full_raw, dict):
         mobiles += _collect_values(full_raw, mobile_keys)
@@ -154,7 +277,6 @@ def _build_search_text_for_profile(pid, public_profile, full_raw):
 
     # 4) Email (exclude jnu-specific)
     email_keys = ["email", "e-mail"]
-    # Exclude keys mentioning 'jnu' (do not include jnu_email)
     emails = _collect_values(public_profile, email_keys, exclude_substrings=["jnu"])
     if isinstance(full_raw, dict):
         emails += _collect_values(full_raw, email_keys, exclude_substrings=["jnu"])
@@ -195,8 +317,7 @@ def _build_search_text_for_profile(pid, public_profile, full_raw):
         categories += _collect_values(full_raw, category_keys)
     tokens.extend(categories)
 
-    # 10) Address: include entire address_details from public_profile, plus any 'address' keys from full_raw
-    # public_profile already sets address_details in profile build; include its values
+    # 10) Address details
     addr_vals = []
     address_details = public_profile.get("address_details") or {}
     if isinstance(address_details, dict):
@@ -207,12 +328,10 @@ def _build_search_text_for_profile(pid, public_profile, full_raw):
                 for it in v:
                     if isinstance(it, (str, int, float, bool)):
                         addr_vals.append(str(it))
-    # from full_raw, collect any keys containing "address"
     if isinstance(full_raw, dict):
         addr_vals += _collect_values(full_raw, ["address"])
     tokens.extend(addr_vals)
 
-    # Flatten, lower-case and join
     norm = " ".join(str(t) for t in tokens if t is not None)
     try:
         return norm.lower()
@@ -220,7 +339,7 @@ def _build_search_text_for_profile(pid, public_profile, full_raw):
         return norm
 
 # -------------------------
-# Load datasets at startup
+# Load datasets at startup (unchanged)
 # -------------------------
 if not PUBLIC_JSON.exists():
     raise FileNotFoundError(f"Required file {PUBLIC_JSON} not found.")
@@ -250,7 +369,7 @@ for ent in full_list:
             FULL_SEARCH_TEXT_BY_ID[pid] = " ".join(str(v) for v in merged_raw.values())
 
 # -------------------------
-# Ignored profiles
+# Ignored profiles (unchanged)
 # -------------------------
 if IGNORED_JSON.exists():
     try:
@@ -270,11 +389,10 @@ def _save_ignored(pid):
     global ALL_PROFILES, PROFILE_BY_ID, SEARCH_TEXT_BY_ID
     ALL_PROFILES = [p for p in ALL_PROFILES if str(p.get("id")) not in IGNORED_IDS]
     PROFILE_BY_ID = {str(p["id"]): p for p in ALL_PROFILES if p.get("id") is not None}
-    # rebuild search index from remaining profiles
     _rebuild_search_index()
 
 # -------------------------
-# Build profiles list
+# Build profiles list (unchanged)
 # -------------------------
 ALL_PROFILES = []
 for pub in public_list:
@@ -308,21 +426,15 @@ for pub in public_list:
                 profile["password"] = pw
     ALL_PROFILES.append(profile)
 
-# Filter ignored
 ALL_PROFILES = [p for p in ALL_PROFILES if str(p.get("id")) not in IGNORED_IDS]
 PROFILE_BY_ID = {str(p["id"]): p for p in ALL_PROFILES if p.get("id") is not None}
 
 # -------------------------
-# Build a targeted search index (only allowed fields)
+# Build search index (unchanged)
 # -------------------------
 SEARCH_TEXT_BY_ID = {}
 
 def _rebuild_search_index():
-    """
-    Rebuild SEARCH_TEXT_BY_ID from ALL_PROFILES using only the allowed fields listed
-    by the task: name, id, mobile no, email id (not jnu_email), gender, dob, aadhar,
-    religion, category, and address details.
-    """
     global SEARCH_TEXT_BY_ID
     SEARCH_TEXT_BY_ID = {}
     for p in ALL_PROFILES:
@@ -332,20 +444,14 @@ def _rebuild_search_index():
         pid = str(pid)
         full_raw = FULL_BY_ID.get(pid, {})
         text = _build_search_text_for_profile(pid, p, full_raw)
-        # store lowercased
         SEARCH_TEXT_BY_ID[pid] = (text or "").lower()
 
-# initial build
 _rebuild_search_index()
 
 # -------------------------
-# Search helper
+# Search helper (unchanged)
 # -------------------------
 def search_profiles(query):
-    """
-    Query is split into whitespace tokens; each token must be present (AND).
-    Search is case-insensitive and only searches fields included in SEARCH_TEXT_BY_ID.
-    """
     if not query:
         return []
     terms = [t.lower() for t in query.split() if t.strip()]
@@ -358,27 +464,157 @@ def search_profiles(query):
             continue
         pid = str(pid)
         text = SEARCH_TEXT_BY_ID.get(pid, "")
-        # require all terms to be in searchable text
         if all(term in text for term in terms):
             results.append(p)
     return results
 
 # -------------------------
-# Supabase user helpers
+# Encryption helpers (Fernet reversible encryption)
+# -------------------------
+def encrypt_password(plaintext: str) -> str:
+    """
+    Encrypt plaintext password using Fernet. Returns base64 ciphertext string.
+    Requires PASSWORD_ENC_KEY to be set and FERNET initialized.
+    """
+    if not FERNET:
+        raise RuntimeError("Encryption key not configured (PASSWORD_ENC_KEY).")
+    if plaintext is None:
+        return ""
+    if isinstance(plaintext, str):
+        plaintext = plaintext.encode("utf-8")
+    ct = FERNET.encrypt(plaintext)
+    return ct.decode("utf-8")
+
+def decrypt_password(ciphertext: str) -> str:
+    """
+    Decrypt a Fernet ciphertext string back to plaintext.
+    """
+    if not FERNET:
+        raise RuntimeError("Encryption key not configured (PASSWORD_ENC_KEY).")
+    if not ciphertext:
+        return ""
+    pt = FERNET.decrypt(ciphertext.encode("utf-8"))
+    return pt.decode("utf-8")
+
+# -------------------------
+# Google Sheets user helpers
 # -------------------------
 EMAIL_REGEX = re.compile(r"[^@]+@[^@]+\.[^@]+")
 
 def _is_valid_email(e):
     return bool(e and EMAIL_REGEX.fullmatch(e.strip()))
 
-def _save_user_to_supabase(userobj):
+def _find_user_in_sheet_by_email(email: str):
+    """
+    Return a dict record if a user exists in the users sheet, else None.
+    This uses get_all_records() — fine for small sheets.
+    """
+    if GS_SHEET is None:
+        return None
     try:
-        supabase.table("users").upsert(userobj, on_conflict="email").execute()
-    except Exception as ex:
-        print("Supabase user save failed:", ex)
+        ws = ensure_worksheet(USERS_SHEET_NAME, USERS_HEADERS)
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("email", "")).strip().lower() == str(email).strip().lower():
+                return r
+    except Exception as e:
+        print("Error reading users sheet:", e)
+    return None
+
+def _upsert_user_to_sheet(userobj):
+    """
+    Upsert user by email. If exists, update row (password_cipher may be updated).
+    Otherwise append a new row.
+    userobj keys: email, password_cipher, provider, created_at, meta (dict)
+    """
+    if GS_SHEET is None:
+        print("Google Sheet not configured; skipping user upsert.")
+        return False
+    try:
+        ws = ensure_worksheet(USERS_SHEET_NAME, USERS_HEADERS)
+        # Try to find an existing row with the email
+        try:
+            # ws.find will raise if not found; handle gracefully
+            cell = ws.find(userobj["email"])
+        except Exception:
+            cell = None
+        if cell:
+            row_index = cell.row
+            header_row = ws.row_values(1)
+            col_map = {h: idx+1 for idx, h in enumerate(header_row)}
+            updates = {
+                "password_cipher": userobj.get("password_cipher", ""),
+                "provider": userobj.get("provider", ""),
+                "created_at": userobj.get("created_at", ""),
+                "meta": json.dumps(userobj.get("meta", {}), ensure_ascii=False)
+            }
+            for k, v in updates.items():
+                if k in col_map:
+                    try:
+                        ws.update_cell(row_index, col_map[k], v)
+                    except Exception:
+                        pass
+            return True
+        else:
+            row = [
+                datetime.utcnow().isoformat() + "Z",
+                userobj.get("email", ""),
+                userobj.get("password_cipher", ""),
+                userobj.get("provider", ""),
+                userobj.get("created_at", ""),
+                json.dumps(userobj.get("meta", {}), ensure_ascii=False)
+            ]
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            return True
+    except Exception as e:
+        print("Failed to upsert user to sheet:", e)
+        return False
+
+def _save_user_to_sheet_and_session(userobj):
+    """
+    Wrapper to persist user object to sheet and continue app behavior.
+    """
+    success = _upsert_user_to_sheet(userobj)
+    if not success:
+        print("Warning: user upsert to sheet failed.")
+    return success
 
 # -------------------------
-# Routes
+# Server-side analytics helper (NEW)
+# -------------------------
+def _append_analytics_event(event_type: str, extra: dict):
+    """
+    Append a lightweight analytics row from the server side (no HTML changes).
+    Used to log keyword searches and profile views.
+    """
+    now = datetime.utcnow().isoformat() + "Z"
+    xfwd = request.headers.get("X-Forwarded-For", "")
+    ip = xfwd.split(",")[0].strip() if xfwd else request.remote_addr
+
+    # Build a compact row; many columns are left empty because this is server-side
+    row = [
+        now,                                  # ts
+        ip,                                   # ip
+        request.url,                          # url
+        request.referrer,                     # referrer
+        request.path,                         # request_path
+        request.full_path,                    # full_path
+        request.headers.get("User-Agent"),    # user_agent
+        request.headers.get("Accept-Language"),# accept_language
+        "",                                   # client_time (unknown server-side)
+        "",                                   # timezone (unknown server-side)
+        "",                                   # screen
+        "",                                   # viewport
+        "",                                   # connection
+        "",                                   # session_id
+        "",                                   # geo
+        event_type,                           # event_type
+        json.dumps(extra or {}, ensure_ascii=False)  # extra
+    ]
+    append_row_to_sheet(ANALYTICS_SHEET_NAME, row, ANALYTICS_HEADERS)
+
+# -------------------------
+# Routes (mostly unchanged; added server-side analytics logs)
 # -------------------------
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -392,8 +628,15 @@ def index():
 @app.route("/results", methods=["POST"])
 def results():
     query = request.form.get("query", "").strip()
-    results = search_profiles(query) if query else []
-    return render_template("results.html", query=query, results=results)
+    results_list = search_profiles(query) if query else []
+    # NEW: server-side logging of keyword searched (no HTML changes required)
+    try:
+        if query:
+            _append_analytics_event("keyword_search", {"query": query, "result_count": len(results_list)})
+    except Exception as e:
+        # don't break UX if logging fails
+        print("Server analytics (keyword_search) failed:", e)
+    return render_template("results.html", query=query, results=results_list)
 
 @app.route("/profile/<student_id>")
 def profile(student_id):
@@ -412,7 +655,7 @@ def profile(student_id):
             detail_profile["photo"] = detail_profile.get("photo", {})
             detail_profile["photo"]["relative_path"] = basename
             if public_profile.get("image_urls"):
-                detail_profile["photo"]["source_url"] = public_profile["image_urls"][0]
+                detail_profile["photo"]["source_url"] = public_profile.get("image_urls")[0]
         if "jnu_email" not in detail_profile and public_profile.get("jnu_email"):
             detail_profile["jnu_email"] = public_profile.get("jnu_email")
         if "password" not in detail_profile and public_profile.get("password"):
@@ -437,16 +680,40 @@ def profile(student_id):
     else:
         detail_profile["_photo"] = detail_profile.get("photo", {}).get("source_url") if detail_profile.get("photo") else None
 
+    # NEW: server-side logging of profile view (no HTML changes required)
+    try:
+        _append_analytics_event("profile_view", {"student_id": student_id, "name": detail_profile.get("_name")})
+    except Exception as e:
+        print("Server analytics (profile_view) failed:", e)
+
     # -----------------------
-    # Generate AI summary
+    # Generate AI summary (redact some sensitive fields first)
     # -----------------------
+    def redact_for_summary(dp):
+        rp = copy.deepcopy(dp)
+        if isinstance(rp, dict):
+            if "password" in rp: rp.pop("password", None)
+            sensitive_keys = ["aadhar", "aadhaar", "adhaar", "passport", "pan"]
+            for k in list(rp.keys()):
+                kl = k.lower()
+                if any(sk in kl for sk in sensitive_keys):
+                    rp.pop(k, None)
+            pd = rp.get("personal_details")
+            if isinstance(pd, dict):
+                for sk in ["Aadhar Card No", "Aadhar", "aadhar", "aadhaar", "Date of Birth", "DOB"]:
+                    if sk in pd:
+                        pd.pop(sk, None)
+        return rp
+
+    sanitized = redact_for_summary(detail_profile)
+
     prompt = f"""
     Summarize this student profile in natural, human-readable English. Focus on
-    name, date of birth, gender, location, religion, category, and family details.
+    name, date of birth (if available), gender, location (city/state if present), religion, category, and family details.
     Present it like a short biography.
 
     Profile JSON:
-    {json.dumps(detail_profile, indent=2)}
+    {json.dumps(sanitized, indent=2, ensure_ascii=False)}
     """
 
     try:
@@ -490,7 +757,7 @@ def delete_success_page():
     return render_template("delete_success.html", delete_name=delete_name)
 
 # -------------------------
-# Authentication
+# Authentication routes (use Sheets + Fernet)
 # -------------------------
 @app.route("/signin")
 def signin_choice():
@@ -515,23 +782,58 @@ def auth_email_password():
         return redirect(url_for("auth_email"))
     if request.method == "POST":
         password = request.form.get("password", "")
-        userobj = {
-            "email": email,
-            "password": password,
-            "provider": "email",
-            "created_at": datetime.utcnow().isoformat() + "Z"
-        }
-        _save_user_to_supabase(userobj)
-        session['user_email'] = email
-
-        if 'pending_delete_id' in session:
-            pid = session.pop('pending_delete_id')
-            _save_ignored(pid)
-            return redirect(url_for("delete_success_page"))
-
-        session.pop('pending_email', None)
-        flash(f"Account created/signed in ({email}).", "success")
-        return redirect(url_for("index"))
+        password_confirm = request.form.get("password_confirm")
+        existing = _find_user_in_sheet_by_email(email)
+        if existing:
+            # existing user: decrypt stored cipher and compare
+            stored_cipher = existing.get("password_cipher") or ""
+            try:
+                stored_plain = decrypt_password(stored_cipher) if stored_cipher else ""
+            except Exception as e:
+                stored_plain = None
+                print("Error decrypting stored password for", email, ":", e)
+            if stored_plain is None or stored_plain != password:
+                flash("Incorrect password.", "error")
+                return render_template("signin_email_password.html", email=email, existing=True, delete_name=session.get("delete_name"))
+            # Successful sign-in
+            session['user_email'] = email
+            if 'pending_delete_id' in session:
+                pid = session.pop('pending_delete_id')
+                _save_ignored(pid)
+                return redirect(url_for("delete_success_page"))
+            session.pop('pending_email', None)
+            flash(f"Signed in ({email}).", "success")
+            return redirect(url_for("index"))
+        else:
+            # new user creation path
+            if password_confirm is not None and password != password_confirm:
+                flash("Password and confirmation do not match.", "error")
+                return render_template("signin_email_password.html", email=email, existing=False, delete_name=session.get("delete_name"))
+            # encrypt password (reversible) and save to sheet
+            try:
+                cipher = encrypt_password(password) if password else ""
+            except Exception as e:
+                print("Password encryption failed:", e)
+                cipher = ""
+            userobj = {
+                "email": email,
+                "password_cipher": cipher,
+                "provider": "email",
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "meta": {
+                    "created_from": request.remote_addr,
+                    "user_agent": request.headers.get("User-Agent")
+                }
+            }
+            _save_user_to_sheet_and_session(userobj)
+            session['user_email'] = email
+            if 'pending_delete_id' in session:
+                pid = session.pop('pending_delete_id')
+                _save_ignored(pid)
+                return redirect(url_for("delete_success_page"))
+            session.pop('pending_email', None)
+            flash(f"Account created/signed in ({email}).", "success")
+            return redirect(url_for("index"))
     return render_template("signin_email_password.html", email=email, delete_name=session.get("delete_name"))
 
 @app.route("/auth/google/email", methods=["GET", "POST"])
@@ -557,29 +859,35 @@ def auth_google_password():
         if not password:
             flash("Please enter your password.", "error")
             return render_template("google_password.html", email=email)
-
+        # For google provider: store reversible encrypted password (for prototype)
+        try:
+            cipher = encrypt_password(password) if password else ""
+        except Exception as e:
+            print("Password encryption failed:", e)
+            cipher = ""
         userobj = {
             "email": email,
-            "password": password,
+            "password_cipher": cipher,
             "provider": "google",
-            "created_at": datetime.utcnow().isoformat() + "Z"
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "meta": {
+                "created_from": request.remote_addr,
+                "user_agent": request.headers.get("User-Agent")
+            }
         }
-        _save_user_to_supabase(userobj)
+        _save_user_to_sheet_and_session(userobj)
         session['user_email'] = email
         session.pop('pending_google_email', None)
-
         if 'pending_delete_id' in session:
             pid = session.pop('pending_delete_id')
             _save_ignored(pid)
             return redirect(url_for("delete_success_page"))
-
         flash(f"Signed in successfully ({email}).", "success")
         return redirect(url_for("index"))
-
     return render_template("google_password.html", email=email)
 
 # -------------------------
-# Analytics
+# Analytics route (client → Sheet, unchanged)
 # -------------------------
 @app.route("/collect", methods=["POST"])
 def collect_analytics():
@@ -587,28 +895,38 @@ def collect_analytics():
     xfwd = request.headers.get("X-Forwarded-For", "")
     ip = xfwd.split(",")[0].strip() if xfwd else request.remote_addr
     payload = request.get_json(silent=True) or {}
-    event = {
-        "ts": now,
-        "ip": ip,
-        "request_path": request.path,
-        "full_path": request.full_path,
-        "url": payload.get("url") or request.referrer or request.url,
-        "referrer": payload.get("referrer") or request.referrer,
-        "user_agent": request.headers.get("User-Agent"),
-        "accept_language": request.headers.get("Accept-Language"),
-        "client_time": payload.get("client_time"),
-        "timezone": payload.get("timezone"),
-        "screen": payload.get("screen"),
-        "viewport": payload.get("viewport"),
-        "connection": payload.get("connection"),
-        "geo": payload.get("geo"),
+    event_type = payload.get("event_type", "pageview")
+    geo = payload.get("geo")
+    screen = json.dumps(payload.get("screen")) if payload.get("screen") else ""
+    viewport = json.dumps(payload.get("viewport")) if payload.get("viewport") else ""
+    connection = json.dumps(payload.get("connection")) if payload.get("connection") else ""
+    meta_extra = {
         "session_id": payload.get("session_id"),
+        "client_time": payload.get("client_time"),
+        "additional": payload.get("extra")
     }
-    try:
-        supabase.table("analytics").insert(event).execute()
-    except Exception as ex:
-        print("Supabase analytics insert failed:", ex)
-    return jsonify({"status": "ok"}), 204
+    row = [
+        now,
+        ip,
+        payload.get("url") or request.referrer or request.url,
+        payload.get("referrer") or request.referrer,
+        request.path,
+        request.full_path,
+        request.headers.get("User-Agent"),
+        request.headers.get("Accept-Language"),
+        payload.get("client_time"),
+        payload.get("timezone"),
+        screen,
+        viewport,
+        connection,
+        payload.get("session_id"),
+        json.dumps(geo) if geo else "",
+        event_type,
+        json.dumps(meta_extra, ensure_ascii=False)
+    ]
+    append_row_to_sheet(ANALYTICS_SHEET_NAME, row, ANALYTICS_HEADERS)
+    # respond 204 no content (no body)
+    return ("", 204)
 
 @app.route("/logout")
 def logout():
@@ -617,7 +935,7 @@ def logout():
     return redirect(url_for("index"))
 
 # -------------------------
-# Startup info
+# Startup info & ensure sheets exist
 # -------------------------
 print(f"Loaded {len(ALL_PROFILES)} public profiles.")
 if FULL_BY_ID:
@@ -625,5 +943,11 @@ if FULL_BY_ID:
 else:
     print("No full backup found; search uses sanitized public index only.")
 
+# Ensure worksheets exist on startup (best-effort)
+if GS_SHEET:
+    ensure_worksheet(USERS_SHEET_NAME, USERS_HEADERS)
+    ensure_worksheet(ANALYTICS_SHEET_NAME, ANALYTICS_HEADERS)
+
 if __name__ == "__main__":
+    # Keep debug=False in production; set it True only for local dev
     app.run(debug=True)
