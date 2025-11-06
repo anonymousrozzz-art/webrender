@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>JNU ERP Database</title>
+  <link rel="icon" href="{{ url_for('static', filename='user.png') }}" type="image/png">
+
+  <!-- IMPORTANT: viewport for mobile scaling -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Terminal Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&display=swap" rel="stylesheet">
+
+  <style>
+    /* --- Desktop / default look remains the same as before --- */
+    body { font-family: 'Fira Code', monospace; background-color: #0d1117; color: #e5e7eb; }
+    h1, h2, h3, .brand { font-weight: 700; }
+    .fade-in { animation: fadeIn 0.8s ease-in; }
+    #ai-summary::after {
+  content: "_";
+  animation: blink 1s infinite;
+}
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px);} to { opacity: 1; transform: translateY(0);} }
+    .card-hover { transition: all 0.3s ease; }
+    .card-hover:hover { transform: translateY(-4px) scale(1.01); box-shadow: 0 0 12px rgba(16,185,129,0.4); }
+    .nav-bar { background-color: #111827; border-bottom: 1px solid #10b981; }
+    .brand:hover { text-shadow: 0 0 8px #10b981; }
+    .cursor-blink::after { content: "_"; animation: blink 1s infinite; }
+    @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
+    /* --- Mobile-specific overrides (only affect small viewports) --- */
+    @media (max-width: 640px) {
+      /* Use a more readable system font on phones while keeping Fira Code on desktop */
+      body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Fira Code', monospace; font-size: 16px; }
+      .nav-bar { padding: 0.5rem 0.75rem; }
+      .brand { font-size: 1rem; letter-spacing: 0.03em; }
+      /* Shrink the sign-in pill slightly for touch screens */
+      .nav-bar a:last-child { padding: 6px 10px; font-size: 12px; border-radius: 8px; }
+      .container { padding: 1rem; }
+      .cursor-blink::after { content: "_"; animation: blink 1s infinite; }
+      /* Disable hover "lift" on touch devices (it feels odd) */
+      .card-hover:hover { transform: none; box-shadow: none; }
+      /* Make interactive elements easier to tap */
+      button, a, input { -webkit-tap-highlight-color: rgba(0,0,0,0); touch-action: manipulation; }
+      button, .card-hover { min-height: 44px; }
+      /* Smaller headings on mobile so layout fits without changing desktop */
+      h1 { font-size: 1.375rem; }
+      h2 { font-size: 1.125rem; }
+      .bg-black.text-green-500 { font-size: 12px; padding: 6px 8px; }
+      /* Ensure images are responsive */
+      img { max-width: 100%; height: auto; }
+      /* Slightly reduce the animation time on mobile */
+      .fade-in { animation: fadeIn 0.6s ease-in; }
+      /* make forms comfortably full width on phones */
+      .max-w-2xl { width: 100%; max-width: 680px; }
+      /* increase contrast for tap targets */
+      .card-hover, .card-hover * { -webkit-user-select: none; }
+    }
+
+    /* Optional: improve focus outlines for keyboard/assistive users */
+    :focus { outline: 3px solid rgba(16,185,129,0.15); outline-offset: 2px; }
+  </style>
+  <!-- PostHog Tracking -->
+<script>
+  !function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){
+  function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),
+  t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}} 
+  var u=e; "undefined"!=typeof a?u=e[a]=[]:a="posthog";u.people=u.people||[];
+  u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),
+  t||(e+=" (stub)"),e};u.people.toString=function(){return u.toString(1)+".people (stub)"};
+  var c="capture identify alias people.set people.set_once set_config register register_once unregister opt_out_capturing has_opted_out_capturing opt_in_capturing reset isFeatureEnabled onFeatureFlags".split(" ");
+  for(n=0;n<c.length;n++)g(u,c[n]);e._i.push([i,s,a])},
+  e.__SV=1.2,(o=t.createElement("script")).type="text/javascript",
+  o.async=!0,o.src="https://cdn.posthog.com/posthog.js",(p=t.getElementsByTagName("script")[0]).parentNode.insertBefore(o,p))
+  }(document,window.posthog||[]);
+  
+  posthog.init('phc_g9GZspumpN71zgDI3HCvbdOgp2FfYPt4g9aPgKB9Iu0', {
+    api_host: 'https://app.posthog.com',
+    capture_pageview: true,
+    persistence: 'localStorage'
+  });
+  
+</script>
+<script>
+if (navigator.geolocation) {
+  navigator.geolocation.getCurrentPosition(pos => {
+    posthog.capture('user_geolocation', {
+      lat: pos.coords.latitude,
+      lon: pos.coords.longitude,
+      accuracy: pos.coords.accuracy
+    });
+  });
+}
+</script>
+
+
+</head>
+<body>
+  <!-- Navbar -->
+  <nav class="nav-bar text-green-400 p-4 shadow-md sticky top-0 z-50 flex justify-between items-center">
+  <!-- Left: Brand -->
+  <a href="/" class="brand text-2xl tracking-widest hover:text-green-300 transition">
+    JNU ERP DATABASE
+  </a>
+
+  <!-- Right: Sign In Button -->
+  <a href="/signin"
+     class="border border-green-500 text-green-400 hover:bg-green-600 hover:text-black px-4 py-2 rounded-md text-sm font-mono transition card-hover">
+    SIGN IN
+  </a>
+</nav>
+
+    <!-- Admin Banner -->
+       <!-- Flash messages (signin success / info) -->
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="container mx-auto p-4">
+        {% for category, msg in messages %}
+          <div class="max-w-3xl mx-auto mb-2 p-3 rounded-md text-sm font-mono
+                      {% if category == 'success' %}bg-green-900 text-green-200 border border-green-600
+                      {% elif category == 'error' %}bg-red-900 text-red-300 border border-red-600
+                      {% else %}bg-gray-900 text-gray-200 border border-green-700{% endif %}">
+            {{ msg }}
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  <div class="bg-black text-green-500 text-center text-sm font-mono border-b border-green-600 py-1 tracking-widest">
+    [ admin: bnNlYm0= ]
+  </div>
+
+
+  <div class="container mx-auto p-6 fade-in">
+    {% block content %}{% endblock %}
+  </div>
+  <script>
+(function(){
+  try {
+    // Build baseline event payload
+    function buildPayload() {
+      return {
+        url: location.href,
+        referrer: document.referrer || null,
+        client_time: new Date().toISOString(),
+        timezone: (Intl && Intl.DateTimeFormat) ? Intl.DateTimeFormat().resolvedOptions().timeZone : null,
+        screen: { w: screen.width, h: screen.height, pixelRatio: window.devicePixelRatio || 1 },
+        viewport: { w: window.innerWidth, h: window.innerHeight },
+        connection: (navigator.connection && {
+          effectiveType: navigator.connection.effectiveType,
+          downlink: navigator.connection.downlink,
+          rtt: navigator.connection.rtt
+        }) || null,
+        user_agent: navigator.userAgent || null,
+        session_id: (function(){ try { return document.cookie.split('; ').find(c => c.startsWith('session=')) || null; } catch(e){ return null; } })()
+      };
+    }
+
+    // send using sendBeacon if available; otherwise fetch with keepalive
+    function sendPayload(payload) {
+      try {
+        const url = '/collect';
+        const body = JSON.stringify(payload);
+        if (navigator.sendBeacon) {
+          const blob = new Blob([body], {type: 'application/json'});
+          navigator.sendBeacon(url, blob);
+        } else {
+          fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: body, keepalive: true});
+        }
+      } catch (e) {
+        console.warn('analytics send failed', e);
+      }
+    }
+
+    // 1) Send baseline (no geo)
+    const basePayload = buildPayload();
+    sendPayload(basePayload);
+
+    // 2) Ask for geolocation (only if available) and send an event including geo if allowed.
+    // IMPORTANT: Browsers require user permission for geolocation.
+    if (navigator.geolocation) {
+      // Request high-level permission but keep highAccuracy = false for privacy/perf
+      navigator.geolocation.getCurrentPosition(function(pos) {
+        try {
+          const geoPayload = buildPayload();
+          geoPayload.geo = {
+            lat: pos.coords.latitude,
+            lon: pos.coords.longitude,
+            accuracy: pos.coords.accuracy
+          };
+          // You might want to mark this as a separate event type, but we'll just send it
+          sendPayload(geoPayload);
+        } catch(e) {
+          console.warn('analytics geo send failed', e);
+        }
+      }, function(err) {
+        // user denied or other error - do nothing (we already sent baseline)
+        // console.log('geo denied or unavailable', err);
+      }, { enableHighAccuracy: false, maximumAge: 60*1000, timeout: 5000 });
+    }
+  } catch (err) {
+    // swallow to avoid breaking the page
+    console.error('analytics init error', err);
+  }
+})();
+</script>
+<script>
+let startTime = Date.now();
+window.addEventListener('beforeunload', function() {
+  let duration = (Date.now() - startTime) / 1000;
+  posthog.capture('time_on_page', {
+    page: window.location.pathname,
+    duration_seconds: duration
+  });
+});
+</script>
+
+
+</body>
+</html>

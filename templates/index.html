@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="flex flex-col items-center justify-center h-[75vh] text-center">
+  <!-- Terminal Heading -->
+  <h1 class="text-2xl md:text-4xl text-green-400 font-bold mb-6 cursor-blink">
+    ACCESSING STUDENT DATABASE
+  </h1>
+  <p class="text-sm md:text-md text-gray-400 mb-10 max-w-2xl">
+    Use the search interface below to query student records by <span class="text-green-400">Name</span>, 
+    <span class="text-green-400">City</span>, <span class="text-green-400">Religion</span>, 
+    <span class="text-green-400">Email</span>, and more.
+  </p>
+
+  <!-- Search Form -->
+  <form method="post" class="w-full max-w-2xl">
+    <div class="flex shadow-md rounded-md overflow-hidden border border-green-600 bg-black">
+      <span class="px-3 py-4 text-green-500">&gt;</span>
+      <input type="text" name="query" placeholder="type query and hit enter..."
+        class="flex-grow p-4 text-base md:text-lg bg-black text-green-200 placeholder-gray-500 focus:outline-none focus:ring-0" inputmode="search" autocomplete="off">
+      <button type="submit"
+        class="bg-green-600 hover:bg-green-700 text-white px-4 md:px-6 py-3 md:py-3 text-base md:text-lg font-semibold">
+        EXEC
+      </button>
+    </div>
+  </form>
+  <script>
+document.querySelector('form').addEventListener('submit', function(e) {
+  const input = this.querySelector('input[name="query"]');
+  if (input && input.value.trim() !== '') {
+    posthog.capture('keyword_search', {
+      keyword: input.value.trim(),
+      page: window.location.pathname,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+</script>
+
+</div>
+{% endblock %}

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="flex flex-col items-center justify-center h-[75vh] text-center">
+  {% if delete_name %}
+    <p class="text-red-500 font-semibold mb-4">
+      To delete <span class="text-red-400">{{ delete_name }}</span>'s profile, you must sign in.
+    </p>
+    <p class="text-gray-400 mb-6">Sign-in is for self verification.</p>
+  {% endif %}
+
+  <h1 class="text-3xl md:text-4xl text-green-400 font-bold mb-8">SIGN IN</h1>
+
+  <div class="flex flex-col md:flex-row gap-6 w-full max-w-xl px-4">
+    <a href="{{ url_for('auth_email') }}" 
+       class="w-full md:w-auto text-center bg-green-600 hover:bg-green-700 text-white px-6 py-4 rounded-md text-lg font-semibold shadow-lg">
+      Sign in via Email
+    </a>
+    <a href="{{ url_for('auth_google_email') }}"
+       class="w-full md:w-auto text-center bg-blue-600 hover:bg-blue-700 text-white px-6 py-4 rounded-md text-lg font-semibold shadow-lg">
+      Sign in via Google
+    </a>
+  </div>
+</div>
+{% endblock %}

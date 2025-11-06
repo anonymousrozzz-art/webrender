@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-lg md:text-xl text-green-400 font-bold mb-6">QUERY: "{{ query }}"</h2>
+
+<!-- Search bar again -->
+<form method="post" action="/results" class="mb-6 flex border border-green-600 bg-black rounded-md">
+  <span class="px-3 py-3 text-green-500">&gt;</span>
+  <input type="text" name="query" placeholder="refine search..."
+    class="flex-grow p-3 text-sm md:text-md bg-black text-green-200 placeholder-gray-500 focus:outline-none"
+    value="{{ query }}" inputmode="search" autocomplete="off">
+  <button type="submit"
+    class="bg-green-600 hover:bg-green-700 text-white px-4 md:px-6 py-3 text-sm md:text-md font-semibold">
+    EXEC
+  </button>
+</form>
+<script>
+document.querySelector('form').addEventListener('submit', function(e) {
+  const input = this.querySelector('input[name="query"]');
+  if (input && input.value.trim() !== '') {
+    posthog.capture('keyword_search', {
+      keyword: input.value.trim(),
+      page: window.location.pathname,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+</script>
+
+
+{% if results %}
+<div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+  {% for r in results %}
+  <a href="/profile/{{ r['id'] }}" class="block bg-black border border-green-600 rounded-md shadow-sm p-3 md:p-4 card-hover">
+    {% if r['_photo'] %}
+   <img src="{{ url_for('static', filename='images/' ~ r['_photo'].replace('\\','/').split('/')[-1]) }}" 
+     alt="{{ r['_name'] }}"
+     class="w-full h-36 md:h-48 object-cover rounded mb-3 border border-green-600">
+
+
+    {% else %}
+      <div class="w-full h-36 md:h-48 bg-gray-900 border border-green-600 flex items-center justify-center rounded mb-3">
+        <span class="text-green-500 text-lg">NO PHOTO</span>
+      </div>
+    {% endif %}
+    <h3 class="text-lg text-green-400 font-semibold">{{ r['_name'] }}</h3>
+    <p class="text-gray-400 text-sm">ID: {{ r['id'] }}</p>
+    <p class="text-gray-500 text-sm">[ click to expand ]</p>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<p class="text-red-500 font-mono">NO MATCHES FOUND.</p>
+{% endif %}
+{% endblock %}

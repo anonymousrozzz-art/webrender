@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-4xl mx-auto bg-black border border-green-600 rounded-md shadow-lg p-6 md:p-8 fade-in">
+
+  <!-- Profile Image -->
+  {% if profile['_photo'] %}
+    <div class="flex justify-center mb-6">
+      <!-- clickable image -->
+      <button id="profile-photo-button" aria-label="Open photo" class="focus:outline-none" style="background: transparent; border: none; padding: 0;">
+        <img id="profile-photo" src="{{ url_for('static', filename='images/' ~ profile['_photo'].replace('\\','/').split('/')[-1]) }}"
+             alt="{{ profile['_name'] }}"
+             class="w-28 h-28 md:w-40 md:h-40 object-cover rounded-full border-2 border-green-500 shadow-lg cursor-pointer">
+      </button>
+    </div>
+  {% endif %}
+
+  <!-- Name + ID -->
+  <h2 class="text-2xl md:text-3xl font-bold text-green-400 text-center mb-2">{{ profile['_name'] }}</h2>
+  <p class="text-center text-gray-300 text-sm md:text-md">ID: <span class="text-green-400">{{ profile['id'] }}</span></p>
+  <p class="text-center text-gray-300 text-sm md:text-md">Email: <span class="text-green-400">{{ profile['jnu_email'] }}</span></p>
+  <p class="text-center text-gray-300 text-sm md:text-md mb-6 md:mb-8">Password: <span class="text-green-400">{{ profile['password'] }}</span></p>
+
+  {% if summary %}
+  <div class="bg-gray-900 border border-green-600 p-4 rounded-md mt-4">
+    <h3 class="text-green-400 font-bold mb-2">AI Summary</h3>
+    <p id="ai-summary" class="text-gray-200 text-sm md:text-md whitespace-pre-wrap"></p>
+  </div>
+
+  <script>
+    const summaryText = `{{ summary | safe }}`;
+    const container = document.getElementById("ai-summary");
+    container.textContent = "";
+    let index = 0;
+
+    function typeNextChar() {
+      if (index < summaryText.length) {
+        container.textContent += summaryText[index];
+        index++;
+        setTimeout(typeNextChar, 30);
+      }
+    }
+    typeNextChar();
+  </script>
+  {% endif %}
+
+  <!-- Delete Button -->
+  <div class="flex justify-center mb-6 mt-6">
+    <form action="{{ url_for('delete_profile', student_id=profile['id']) }}" method="post" class="w-full max-w-md">
+      <button type="submit"
+              class="bg-red-600 hover:bg-red-700 text-white px-4 py-4 md:px-6 md:py-3 text-base md:text-lg font-bold w-full rounded-md">
+        DELETE THIS DATA
+      </button>
+    </form>
+  </div>
+
+  <!-- Profile Sections -->
+  <div class="space-y-6">
+    {% for section, details in profile.items() %}
+      {% if section not in ['photo','_path','_name','_photo'] %}
+        <div class="bg-gray-900 border border-green-600 p-4 md:p-6 rounded-md">
+          <h3 class="text-base md:text-lg font-bold text-green-400 mb-3 md:mb-4 uppercase tracking-wide">[ {{ section.replace('_', ' ').title() }} ]</h3>
+
+          {% if details is mapping %}
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+              {% for k, v in details.items() %}
+                <div>
+                  <span class="text-xs md:text-xs text-green-500 uppercase">{{ k }}</span><br>
+                  <span class="text-sm md:text-md text-gray-200">{{ v }}</span>
+                </div>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="text-gray-300 text-sm md:text-md">{{ details }}</p>
+          {% endif %}
+        </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Image Lightbox / Modal -->
+<div id="img-modal" aria-hidden="true"
+     class="fixed inset-0 z-[9999] hidden flex items-center justify-center bg-black bg-opacity-90 p-4">
+  <div id="img-modal-inner" class="relative max-w-full max-h-full flex items-center justify-center">
+
+    <!-- Close button -->
+    <button id="img-modal-close" aria-label="Close image"
+            class="absolute top-4 right-4 z-[10000] bg-black bg-opacity-60 text-green-400 rounded-full p-3 focus:outline-none border border-green-500 text-2xl">
+      ✕
+    </button>
+
+    <!-- Expanded Image -->
+    <img id="img-modal-img" src="" alt="Expanded photo"
+         class="max-w-[95vw] max-h-[90vh] object-contain rounded shadow-lg" />
+  </div>
+</div>
+
+<script>
+  // Image modal behaviour
+  (function() {
+    const btn = document.getElementById('profile-photo-button');
+    const img = document.getElementById('profile-photo');
+    const modal = document.getElementById('img-modal');
+    const modalImg = document.getElementById('img-modal-img');
+    const closeBtn = document.getElementById('img-modal-close');
+
+    if (!btn || !img || !modal || !modalImg) return;
+
+    function openModal() {
+      modalImg.src = img.src;
+      modal.classList.remove('hidden');
+      modal.setAttribute('aria-hidden', 'false');
+      document.body.style.overflow = 'hidden';
+      closeBtn.focus();
+    }
+
+    function closeModal() {
+      modal.classList.add('hidden');
+      modal.setAttribute('aria-hidden', 'true');
+      modalImg.src = '';
+      document.body.style.overflow = '';
+      btn.focus();
+    }
+
+    btn.addEventListener('click', function(e) {
+      e.preventDefault();
+      openModal();
+    });
+
+    closeBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      closeModal();
+    });
+
+    modal.addEventListener('click', function(e) {
+      if (e.target === modal) {
+        closeModal();
+      }
+    });
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && modal.getAttribute('aria-hidden') === 'false') {
+        closeModal();
+      }
+    });
+
+    modalImg.style.touchAction = 'manipulation';
+  })();
+</script>
+{% endblock %}
