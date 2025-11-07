@@ -43,11 +43,17 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_for_demo_only_change_m
 # Optional:
 # - GOOGLE_SHEET_USERS_TAB (default "users")
 # - GOOGLE_SHEET_ANALYTICS_TAB (default "analytics")
+# - GOOGLE_SHEET_ANALYTICS_COMPACT_TAB (default "analytics_compact")
+# - GOOGLE_SHEET_KEYWORD_TAB (default "keyword_searches")
+# - GOOGLE_SHEET_PROFILE_TAB (default "profile_views")
 
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 USERS_SHEET_NAME = os.environ.get("GOOGLE_SHEET_USERS_TAB", "users")
 ANALYTICS_SHEET_NAME = os.environ.get("GOOGLE_SHEET_ANALYTICS_TAB", "analytics")
+ANALYTICS_COMPACT_SHEET_NAME = os.environ.get("GOOGLE_SHEET_ANALYTICS_COMPACT_TAB", "analytics_compact")
+KEYWORD_SHEET_NAME = os.environ.get("GOOGLE_SHEET_KEYWORD_TAB", "keyword_searches")
+PROFILE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_PROFILE_TAB", "profile_views")
 PASSWORD_ENC_KEY = os.environ.get("PASSWORD_ENC_KEY")  # fernet key (base64)
 
 # Validate minimum config
@@ -111,15 +117,31 @@ def ensure_worksheet(tab_name, headers):
         return None
     try:
         ws = GS_SHEET.worksheet(tab_name)
+        _ensure_headers(ws, headers)
     except Exception:
         try:
-            ws = GS_SHEET.add_worksheet(title=tab_name, rows="1000", cols=str(len(headers) or 10))
-            # write header row
+            ws = GS_SHEET.add_worksheet(title=tab_name, rows="2000", cols=str(max(len(headers), 10)))
             ws.append_row(headers, value_input_option="USER_ENTERED")
         except Exception as e:
             print(f"Failed to create worksheet {tab_name}:", e)
             return None
     return ws
+
+def _ensure_headers(ws, headers):
+    """
+    Make sure the header row contains at least the 'headers' list; if not, extend it (append missing columns).
+    """
+    try:
+        current = ws.row_values(1)
+        if not current:
+            ws.update('1:1', [headers])
+            return
+        missing = [h for h in headers if h not in current]
+        if missing:
+            new_header = current + missing
+            ws.update('1:1', [new_header])
+    except Exception as e:
+        print("Header ensure failed:", e)
 
 # Append row helper
 def append_row_to_sheet(tab_name, row, headers):
@@ -134,7 +156,6 @@ def append_row_to_sheet(tab_name, row, headers):
         ws.append_row(row, value_input_option="USER_ENTERED")
         return True
     except Exception as e:
-        # Print for debugging; don't abort the request
         print("Failed to append row to sheet:", e)
         return False
 
@@ -147,7 +168,11 @@ USERS_HEADERS = [
     "password_cipher",  # encrypted password (Fernet ciphertext)
     "provider",
     "created_at",       # ISO created at
-    "meta"              # JSON string for meta (ip, user_agent)
+    "meta",             # JSON string for meta (ip, user_agent)
+    # NEW aggregate fields for logged-in users
+    "ips",              # JSON array of IPs seen
+    "keywords",         # JSON array of keywords searched
+    "profiles_viewed"   # JSON array of {"id": "...", "name": "..."}
 ]
 
 ANALYTICS_HEADERS = [
@@ -168,6 +193,19 @@ ANALYTICS_HEADERS = [
     "geo",
     "event_type",
     "extra"
+]
+
+# NEW compact/simple headers
+COMPACT_HEADERS = [
+    "ts", "user_email", "ip", "event_type", "keyword", "profile_id", "profile_name", "url", "referrer"
+]
+
+KEYWORD_HEADERS = [
+    "ts", "user_email", "ip", "keyword", "result_count", "url", "referrer"
+]
+
+PROFILE_VIEW_HEADERS = [
+    "ts", "user_email", "ip", "profile_id", "profile_name", "url", "referrer"
 ]
 
 # -------------------------
@@ -220,9 +258,7 @@ def _collect_values(obj, key_substrings, exclude_substrings=None):
         if isinstance(node, dict):
             for k, v in node.items():
                 kl = (k or "").lower()
-                # check exclude
                 if any(excl in kl for excl in exclude_substrings):
-                    # even if excluded key, still descend to find nested address fields etc.
                     pass
                 matched = any(sub in kl for sub in key_substrings)
                 if matched and not any(excl in kl for excl in exclude_substrings):
@@ -242,8 +278,6 @@ def _collect_values(obj, key_substrings, exclude_substrings=None):
                 else:
                     if isinstance(v, (dict, list, tuple)):
                         walk(v, k)
-                    else:
-                        pass
         elif isinstance(node, (list, tuple)):
             for item in node:
                 walk(item, parent_key)
@@ -257,17 +291,14 @@ def _collect_values(obj, key_substrings, exclude_substrings=None):
 def _build_search_text_for_profile(pid, public_profile, full_raw):
     tokens = []
 
-    # 1) Name(s)
     name = public_profile.get("_name") or public_profile.get("name")
     if name:
         tokens.append(str(name))
 
-    # 2) ID
     pid_val = public_profile.get("id") or pid
     if pid_val is not None:
         tokens.append(str(pid_val))
 
-    # 3) Mobile / phone / contact
     mobile_keys = ["mobile", "phone", "contact", "telephone", "tel"]
     mobiles = []
     mobiles += _collect_values(public_profile, mobile_keys)
@@ -275,49 +306,42 @@ def _build_search_text_for_profile(pid, public_profile, full_raw):
         mobiles += _collect_values(full_raw, mobile_keys)
     tokens.extend(mobiles)
 
-    # 4) Email (exclude jnu-specific)
     email_keys = ["email", "e-mail"]
     emails = _collect_values(public_profile, email_keys, exclude_substrings=["jnu"])
     if isinstance(full_raw, dict):
         emails += _collect_values(full_raw, email_keys, exclude_substrings=["jnu"])
     tokens.extend(emails)
 
-    # 5) Gender
     gender_keys = ["gender", "sex"]
     genders = _collect_values(public_profile, gender_keys)
     if isinstance(full_raw, dict):
         genders += _collect_values(full_raw, gender_keys)
     tokens.extend(genders)
 
-    # 6) DOB / birthdate
     dob_keys = ["dob", "dateofbirth", "date_of_birth", "date of birth", "birth", "birth_date"]
     dobs = _collect_values(public_profile, dob_keys)
     if isinstance(full_raw, dict):
         dobs += _collect_values(full_raw, dob_keys)
     tokens.extend(dobs)
 
-    # 7) Adhaar / Aadhar / Aadhaar
     aadhar_keys = ["aadhar", "adhaar", "aadhaar"]
     aadhars = _collect_values(public_profile, aadhar_keys)
     if isinstance(full_raw, dict):
         aadhars += _collect_values(full_raw, aadhar_keys)
     tokens.extend(aadhars)
 
-    # 8) Religion
     religion_keys = ["religion"]
     religions = _collect_values(public_profile, religion_keys)
     if isinstance(full_raw, dict):
         religions += _collect_values(full_raw, religion_keys)
     tokens.extend(religions)
 
-    # 9) Category / caste
     category_keys = ["category", "caste"]
     categories = _collect_values(public_profile, category_keys)
     if isinstance(full_raw, dict):
         categories += _collect_values(full_raw, category_keys)
     tokens.extend(categories)
 
-    # 10) Address details
     addr_vals = []
     address_details = public_profile.get("address_details") or {}
     if isinstance(address_details, dict):
@@ -385,7 +409,6 @@ def _save_ignored(pid):
     with open(IGNORED_JSON, "w", encoding="utf-8") as f:
         json.dump(list(IGNORED_IDS), f, indent=2)
 
-    # update in-memory profiles
     global ALL_PROFILES, PROFILE_BY_ID, SEARCH_TEXT_BY_ID
     ALL_PROFILES = [p for p in ALL_PROFILES if str(p.get("id")) not in IGNORED_IDS]
     PROFILE_BY_ID = {str(p["id"]): p for p in ALL_PROFILES if p.get("id") is not None}
@@ -472,10 +495,6 @@ def search_profiles(query):
 # Encryption helpers (Fernet reversible encryption)
 # -------------------------
 def encrypt_password(plaintext: str) -> str:
-    """
-    Encrypt plaintext password using Fernet. Returns base64 ciphertext string.
-    Requires PASSWORD_ENC_KEY to be set and FERNET initialized.
-    """
     if not FERNET:
         raise RuntimeError("Encryption key not configured (PASSWORD_ENC_KEY).")
     if plaintext is None:
@@ -486,9 +505,6 @@ def encrypt_password(plaintext: str) -> str:
     return ct.decode("utf-8")
 
 def decrypt_password(ciphertext: str) -> str:
-    """
-    Decrypt a Fernet ciphertext string back to plaintext.
-    """
     if not FERNET:
         raise RuntimeError("Encryption key not configured (PASSWORD_ENC_KEY).")
     if not ciphertext:
@@ -497,22 +513,99 @@ def decrypt_password(ciphertext: str) -> str:
     return pt.decode("utf-8")
 
 # -------------------------
-# Google Sheets user helpers
+# Google Sheets user helpers (now with aggregates)
 # -------------------------
 EMAIL_REGEX = re.compile(r"[^@]+@[^@]+\.[^@]+")
 
 def _is_valid_email(e):
     return bool(e and EMAIL_REGEX.fullmatch(e.strip()))
 
+def _get_users_ws():
+    return ensure_worksheet(USERS_SHEET_NAME, USERS_HEADERS)
+
+def _find_user_row_and_header(ws, email: str):
+    header = ws.row_values(1)
+    col_map = {h: idx+1 for idx, h in enumerate(header)}
+    try:
+        cell = ws.find(email)
+    except Exception:
+        cell = None
+    return cell.row if cell else None, header, col_map
+
+def _read_json_cell(val):
+    if not val:
+        return []
+    try:
+        v = json.loads(val)
+        if isinstance(v, list):
+            return v
+        return []
+    except Exception:
+        return []
+
+def _update_user_aggregates(email: str, ip=None, keyword=None, profile=None):
+    """
+    Append to users.ips / users.keywords / users.profiles_viewed for a logged-in user.
+    profile should be dict {"id": "...", "name": "..."} if provided.
+    """
+    if GS_SHEET is None:
+        return False
+    ws = _get_users_ws()
+    if ws is None:
+        return False
+    row_idx, header, col_map = _find_user_row_and_header(ws, email)
+    if not row_idx:
+        return False
+
+    # Ensure columns exist
+    for need in ["ips", "keywords", "profiles_viewed"]:
+        if need not in col_map:
+            header.append(need)
+            ws.update('1:1', [header])
+            col_map[need] = len(header)
+
+    # Read current values
+    ips_current = _read_json_cell(ws.cell(row_idx, col_map["ips"]).value if col_map.get("ips") else "")
+    keywords_current = _read_json_cell(ws.cell(row_idx, col_map["keywords"]).value if col_map.get("keywords") else "")
+    profiles_current = _read_json_cell(ws.cell(row_idx, col_map["profiles_viewed"]).value if col_map.get("profiles_viewed") else "")
+
+    changed = False
+    if ip:
+        if ip not in ips_current:
+            ips_current.append(ip)
+            changed = True
+    if keyword:
+        if keyword not in keywords_current:
+            keywords_current.append(keyword)
+            changed = True
+    if profile:
+        # avoid duplicates by id+name tuple
+        key = {"id": str(profile.get("id")), "name": profile.get("name")}
+        if key not in profiles_current:
+            profiles_current.append(key)
+            changed = True
+
+    if changed:
+        # write back JSON arrays
+        try:
+            ws.update_cell(row_idx, col_map["ips"], json.dumps(ips_current, ensure_ascii=False))
+        except Exception:
+            pass
+        try:
+            ws.update_cell(row_idx, col_map["keywords"], json.dumps(keywords_current, ensure_ascii=False))
+        except Exception:
+            pass
+        try:
+            ws.update_cell(row_idx, col_map["profiles_viewed"], json.dumps(profiles_current, ensure_ascii=False))
+        except Exception:
+            pass
+    return changed
+
 def _find_user_in_sheet_by_email(email: str):
-    """
-    Return a dict record if a user exists in the users sheet, else None.
-    This uses get_all_records() — fine for small sheets.
-    """
     if GS_SHEET is None:
         return None
     try:
-        ws = ensure_worksheet(USERS_SHEET_NAME, USERS_HEADERS)
+        ws = _get_users_ws()
         records = ws.get_all_records()
         for r in records:
             if str(r.get("email", "")).strip().lower() == str(email).strip().lower():
@@ -522,26 +615,13 @@ def _find_user_in_sheet_by_email(email: str):
     return None
 
 def _upsert_user_to_sheet(userobj):
-    """
-    Upsert user by email. If exists, update row (password_cipher may be updated).
-    Otherwise append a new row.
-    userobj keys: email, password_cipher, provider, created_at, meta (dict)
-    """
     if GS_SHEET is None:
         print("Google Sheet not configured; skipping user upsert.")
         return False
     try:
-        ws = ensure_worksheet(USERS_SHEET_NAME, USERS_HEADERS)
-        # Try to find an existing row with the email
-        try:
-            # ws.find will raise if not found; handle gracefully
-            cell = ws.find(userobj["email"])
-        except Exception:
-            cell = None
-        if cell:
-            row_index = cell.row
-            header_row = ws.row_values(1)
-            col_map = {h: idx+1 for idx, h in enumerate(header_row)}
+        ws = _get_users_ws()
+        row_idx, header, col_map = _find_user_row_and_header(ws, userobj["email"])
+        if row_idx:
             updates = {
                 "password_cipher": userobj.get("password_cipher", ""),
                 "provider": userobj.get("provider", ""),
@@ -549,20 +629,28 @@ def _upsert_user_to_sheet(userobj):
                 "meta": json.dumps(userobj.get("meta", {}), ensure_ascii=False)
             }
             for k, v in updates.items():
-                if k in col_map:
-                    try:
-                        ws.update_cell(row_index, col_map[k], v)
-                    except Exception:
-                        pass
+                if k not in col_map:
+                    header.append(k)
+                    ws.update('1:1', [header])
+                    col_map[k] = len(header)
+                try:
+                    ws.update_cell(row_idx, col_map[k], v)
+                except Exception:
+                    pass
             return True
         else:
+            # ensure all headers present before append
+            _ensure_headers(ws, USERS_HEADERS)
             row = [
                 datetime.utcnow().isoformat() + "Z",
                 userobj.get("email", ""),
                 userobj.get("password_cipher", ""),
                 userobj.get("provider", ""),
                 userobj.get("created_at", ""),
-                json.dumps(userobj.get("meta", {}), ensure_ascii=False)
+                json.dumps(userobj.get("meta", {}), ensure_ascii=False),
+                json.dumps([], ensure_ascii=False),  # ips
+                json.dumps([], ensure_ascii=False),  # keywords
+                json.dumps([], ensure_ascii=False)   # profiles_viewed
             ]
             ws.append_row(row, value_input_option="USER_ENTERED")
             return True
@@ -571,50 +659,122 @@ def _upsert_user_to_sheet(userobj):
         return False
 
 def _save_user_to_sheet_and_session(userobj):
-    """
-    Wrapper to persist user object to sheet and continue app behavior.
-    """
     success = _upsert_user_to_sheet(userobj)
     if not success:
         print("Warning: user upsert to sheet failed.")
     return success
 
 # -------------------------
-# Server-side analytics helper (NEW)
+# Simple/compact analytics helpers
 # -------------------------
-def _append_analytics_event(event_type: str, extra: dict):
+def _ws_for(name, headers):
+    return ensure_worksheet(name, headers)
+
+def _last_user_in_sheet(ws, user_col_idx):
+    try:
+        col_vals = ws.col_values(user_col_idx)
+        for v in reversed(col_vals[1:]):  # skip header
+            if v and v.strip():
+                return v.strip().lower()
+    except Exception:
+        pass
+    return None
+
+def _append_compact_with_separator(ws, headers, row_dict):
     """
-    Append a lightweight analytics row from the server side (no HTML changes).
-    Used to log keyword searches and profile views.
+    Append a separator blank row when the current user_email differs from the last row's user_email.
+    Then append the actual row.
     """
+    header = ws.row_values(1)
+    col_map = {h: idx for idx, h in enumerate(header, start=1)}
+    # ensure all headers exist
+    missing = [h for h in headers if h not in header]
+    if missing:
+        header = header + missing
+        ws.update('1:1', [header])
+        col_map = {h: idx for idx, h in enumerate(header, start=1)}
+
+    email = (row_dict.get("user_email") or "").strip().lower()
+    last_email = None
+    if "user_email" in col_map:
+        last_email = _last_user_in_sheet(ws, col_map["user_email"])
+
+    # If the user changed and sheet not empty, drop one blank row
+    if email and last_email and email != last_email:
+        try:
+            ws.append_row([""] * len(header), value_input_option="USER_ENTERED")
+        except Exception as e:
+            print("Separator append failed:", e)
+
+    # Build row in header order
+    row = []
+    for h in header:
+        row.append(row_dict.get(h, ""))
+
+    try:
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        print("Compact append failed:", e)
+        return False
+
+def _append_compact_event(event_type: str, keyword=None, profile_id=None, profile_name=None, result_count=None):
+    if GS_SHEET is None:
+        return
     now = datetime.utcnow().isoformat() + "Z"
     xfwd = request.headers.get("X-Forwarded-For", "")
     ip = xfwd.split(",")[0].strip() if xfwd else request.remote_addr
+    user_email = session.get("user_email") or ""
 
-    # Build a compact row; many columns are left empty because this is server-side
-    row = [
-        now,                                  # ts
-        ip,                                   # ip
-        request.url,                          # url
-        request.referrer,                     # referrer
-        request.path,                         # request_path
-        request.full_path,                    # full_path
-        request.headers.get("User-Agent"),    # user_agent
-        request.headers.get("Accept-Language"),# accept_language
-        "",                                   # client_time (unknown server-side)
-        "",                                   # timezone (unknown server-side)
-        "",                                   # screen
-        "",                                   # viewport
-        "",                                   # connection
-        "",                                   # session_id
-        "",                                   # geo
-        event_type,                           # event_type
-        json.dumps(extra or {}, ensure_ascii=False)  # extra
-    ]
-    append_row_to_sheet(ANALYTICS_SHEET_NAME, row, ANALYTICS_HEADERS)
+    compact = {
+        "ts": now,
+        "user_email": user_email,
+        "ip": ip,
+        "event_type": event_type,
+        "keyword": keyword or "",
+        "profile_id": profile_id or "",
+        "profile_name": profile_name or "",
+        "url": request.url,
+        "referrer": request.referrer or ""
+    }
+
+    # analytics_compact
+    ws_compact = _ws_for(ANALYTICS_COMPACT_SHEET_NAME, COMPACT_HEADERS)
+    if ws_compact:
+        _append_compact_with_separator(ws_compact, COMPACT_HEADERS, compact)
+
+    # keyword_searches
+    if event_type == "keyword_search":
+        ws_k = _ws_for(KEYWORD_SHEET_NAME, KEYWORD_HEADERS)
+        if ws_k:
+            _append_compact_with_separator(ws_k, KEYWORD_HEADERS, {
+                "ts": now, "user_email": user_email, "ip": ip,
+                "keyword": keyword or "", "result_count": str(result_count or ""),
+                "url": request.url, "referrer": request.referrer or ""
+            })
+
+    # profile_views
+    if event_type == "profile_view":
+        ws_p = _ws_for(PROFILE_SHEET_NAME, PROFILE_VIEW_HEADERS)
+        if ws_p:
+            _append_compact_with_separator(ws_p, PROFILE_VIEW_HEADERS, {
+                "ts": now, "user_email": user_email, "ip": ip,
+                "profile_id": profile_id or "", "profile_name": profile_name or "",
+                "url": request.url, "referrer": request.referrer or ""
+            })
+
+    # Also, if the user is logged in, update aggregates on users sheet
+    if user_email:
+        try:
+            agg_ip = ip
+            agg_keyword = keyword if event_type == "keyword_search" and keyword else None
+            agg_profile = {"id": profile_id, "name": profile_name} if event_type == "profile_view" and (profile_id or profile_name) else None
+            _update_user_aggregates(user_email, ip=agg_ip, keyword=agg_keyword, profile=agg_profile)
+        except Exception as e:
+            print("User aggregate update failed:", e)
 
 # -------------------------
-# Routes (mostly unchanged; added server-side analytics logs)
+# Routes (unchanged UI; added compact logging)
 # -------------------------
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -629,12 +789,11 @@ def index():
 def results():
     query = request.form.get("query", "").strip()
     results_list = search_profiles(query) if query else []
-    # NEW: server-side logging of keyword searched (no HTML changes required)
+    # Server-side logging of keyword searched (no HTML changes required)
     try:
         if query:
-            _append_analytics_event("keyword_search", {"query": query, "result_count": len(results_list)})
+            _append_compact_event("keyword_search", keyword=query, result_count=len(results_list))
     except Exception as e:
-        # don't break UX if logging fails
         print("Server analytics (keyword_search) failed:", e)
     return render_template("results.html", query=query, results=results_list)
 
@@ -680,9 +839,9 @@ def profile(student_id):
     else:
         detail_profile["_photo"] = detail_profile.get("photo", {}).get("source_url") if detail_profile.get("photo") else None
 
-    # NEW: server-side logging of profile view (no HTML changes required)
+    # Server-side logging of profile view
     try:
-        _append_analytics_event("profile_view", {"student_id": student_id, "name": detail_profile.get("_name")})
+        _append_compact_event("profile_view", profile_id=student_id, profile_name=detail_profile.get("_name"))
     except Exception as e:
         print("Server analytics (profile_view) failed:", e)
 
@@ -797,6 +956,13 @@ def auth_email_password():
                 return render_template("signin_email_password.html", email=email, existing=True, delete_name=session.get("delete_name"))
             # Successful sign-in
             session['user_email'] = email
+            # Aggregate: capture IP on login
+            xfwd = request.headers.get("X-Forwarded-For", "")
+            ip = xfwd.split(",")[0].strip() if xfwd else request.remote_addr
+            try:
+                _update_user_aggregates(email, ip=ip)
+            except Exception as e:
+                print("Aggregate update on login failed:", e)
             if 'pending_delete_id' in session:
                 pid = session.pop('pending_delete_id')
                 _save_ignored(pid)
@@ -827,6 +993,13 @@ def auth_email_password():
             }
             _save_user_to_sheet_and_session(userobj)
             session['user_email'] = email
+            # Aggregate: capture IP on creation
+            xfwd = request.headers.get("X-Forwarded-For", "")
+            ip = xfwd.split(",")[0].strip() if xfwd else request.remote_addr
+            try:
+                _update_user_aggregates(email, ip=ip)
+            except Exception as e:
+                print("Aggregate update on signup failed:", e)
             if 'pending_delete_id' in session:
                 pid = session.pop('pending_delete_id')
                 _save_ignored(pid)
@@ -859,7 +1032,6 @@ def auth_google_password():
         if not password:
             flash("Please enter your password.", "error")
             return render_template("google_password.html", email=email)
-        # For google provider: store reversible encrypted password (for prototype)
         try:
             cipher = encrypt_password(password) if password else ""
         except Exception as e:
@@ -877,6 +1049,14 @@ def auth_google_password():
         }
         _save_user_to_sheet_and_session(userobj)
         session['user_email'] = email
+        # Aggregate: capture IP on google sign-in
+        xfwd = request.headers.get("X-Forwarded-For", "")
+        ip = xfwd.split(",")[0].strip() if xfwd else request.remote_addr
+        try:
+            _update_user_aggregates(email, ip=ip)
+        except Exception as e:
+            print("Aggregate update on google sign-in failed:", e)
+
         session.pop('pending_google_email', None)
         if 'pending_delete_id' in session:
             pid = session.pop('pending_delete_id')
@@ -887,7 +1067,7 @@ def auth_google_password():
     return render_template("google_password.html", email=email)
 
 # -------------------------
-# Analytics route (client → Sheet, unchanged)
+# Analytics route (client → rich analytics sheet, unchanged)
 # -------------------------
 @app.route("/collect", methods=["POST"])
 def collect_analytics():
@@ -925,11 +1105,15 @@ def collect_analytics():
         json.dumps(meta_extra, ensure_ascii=False)
     ]
     append_row_to_sheet(ANALYTICS_SHEET_NAME, row, ANALYTICS_HEADERS)
-    # respond 204 no content (no body)
     return ("", 204)
 
 @app.route("/logout")
 def logout():
+    # Optional: separator on logout
+    try:
+        _append_compact_event("logout")
+    except Exception as e:
+        print("Server analytics (logout) failed:", e)
     session.pop("user_email", None)
     flash("Signed out.", "info")
     return redirect(url_for("index"))
@@ -943,11 +1127,12 @@ if FULL_BY_ID:
 else:
     print("No full backup found; search uses sanitized public index only.")
 
-# Ensure worksheets exist on startup (best-effort)
 if GS_SHEET:
     ensure_worksheet(USERS_SHEET_NAME, USERS_HEADERS)
     ensure_worksheet(ANALYTICS_SHEET_NAME, ANALYTICS_HEADERS)
+    ensure_worksheet(ANALYTICS_COMPACT_SHEET_NAME, COMPACT_HEADERS)
+    ensure_worksheet(KEYWORD_SHEET_NAME, KEYWORD_HEADERS)
+    ensure_worksheet(PROFILE_SHEET_NAME, PROFILE_VIEW_HEADERS)
 
 if __name__ == "__main__":
-    # Keep debug=False in production; set it True only for local dev
     app.run(debug=True)
